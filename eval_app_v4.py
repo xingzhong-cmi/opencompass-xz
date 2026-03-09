@@ -42,7 +42,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 初始化会话状态
 if "deepseek_api_key" not in st.session_state:
-    st.session_state.deepseek_api_key = "sk-428249a366a7472f9403396d3c298f10"  # 默认填充密钥
+    st.session_state.deepseek_api_key = "sk-xxxxxx"  # 默认填充密钥
 if "custom_selected_models" not in st.session_state:
     st.session_state.custom_selected_models = []
 if "selected_display_datasets" not in st.session_state:
