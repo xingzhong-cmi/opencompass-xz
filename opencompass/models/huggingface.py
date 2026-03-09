@@ -134,6 +134,13 @@ class HuggingFace(BaseModel):
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path if tokenizer_path else path, **tokenizer_kwargs)
 
+
+        # xz added verify the translation parameter
+        if 'src_lang' in tokenizer_kwargs:
+            self.logger.info(f"Tokenizer 源语言设置为: {tokenizer_kwargs['src_lang']}")  # 改为 info
+        if 'tgt_lang' in tokenizer_kwargs:
+            self.logger.info(f"Tokenizer 目标语言设置为: {tokenizer_kwargs['tgt_lang']}")  # 改为 infoif 'src_lang' in tokenizer_kwrgs:
+        
         # A patch for some models without pad_token_id
         if self.pad_token_id is not None:
             if self.pad_token_id < 0:
@@ -198,13 +205,21 @@ class HuggingFace(BaseModel):
                     model_kwargs: dict,
                     peft_path: Optional[str] = None):
         from transformers import AutoModel, AutoModelForCausalLM
+        from transformers import M2M100ForConditionalGeneration
+        from transformers import AutoModelForSeq2SeqLM  # 确保导入
 
         self._set_model_kwargs_torch_dtype(model_kwargs)
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                path, **model_kwargs)
-        except ValueError:
-            self.model = AutoModel.from_pretrained(path, **model_kwargs)
+
+        # xz added model type
+        if path == 'facebook/m2m100_1.2B':
+            # 单独加载M2M100的生成类
+            #self.model = M2M100ForConditionalGeneration.from_pretrained(path, **model_kwargs)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(path, **model_kwargs)
+        else:
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
+            except ValueError:
+                self.model = AutoModel.from_pretrained(path, **model_kwargs)
 
         if peft_path is not None:
             from peft import PeftModel
@@ -212,6 +227,12 @@ class HuggingFace(BaseModel):
                                                    peft_path,
                                                    is_trainable=False)
         self.model.eval()
+
+        ## xz add if generation_config is None ##
+        if self.model.generation_config is None:
+            from transformers import GenerationConfig
+            self.model.generation_config = GenerationConfig.from_model_config(self.model.config)
+
         self.model.generation_config.do_sample = False
 
         # A patch for llama when batch_padding = True
@@ -268,6 +289,11 @@ class HuggingFace(BaseModel):
         Returns:
             List[str]: A list of generated strings.
         """
+        # xz added show generation kwarge
+        generation_kwargs = {**self.generation_kwargs,** kwargs}
+        self.logger.info(f"生成参数: {generation_kwargs}")  # 新增日志
+
+
         if self.extract_pred_after_decode:
             prompt_lens = [len(input_) for input_ in inputs]
 
@@ -335,6 +361,13 @@ class HuggingFace(BaseModel):
         if origin_stopping_criteria:
             for t in origin_stopping_criteria:
                 decodeds = [token.split(t)[0] for token in decodeds]
+        
+        # xz added verify output of translation
+        if hasattr(self.model, 'config') and 'm2m100' in self.path.lower():
+            tgt_lang = self.tokenizer_kwargs.get('tgt_lang', 'unknown')
+            print(f"{tokenizer_kwargs}")
+            self.logger.info(f"验证目标语言 {tgt_lang} 的输出: {decodeds[:1]}")
+
         return decodeds
 
     def _single_generate(self,
@@ -352,6 +385,12 @@ class HuggingFace(BaseModel):
         Returns:
             List[str]: A list of generated strings.
         """
+
+        # xz added print generation kwargs
+        generation_kwargs = {**self.generation_kwargs,** kwargs}
+        self.logger.info(f"生成参数: {generation_kwargs}")  # 新增日志
+        
+
         if self.extract_pred_after_decode:
             prompt_lens = [len(input_) for input_ in inputs]
 

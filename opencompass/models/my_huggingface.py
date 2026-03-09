@@ -1,0 +1,929 @@
+import os
+from typing import Dict, List, Optional, Union
+
+import numpy as np
+import torch
+import transformers
+
+from opencompass.models.base import BaseModel
+from opencompass.models.base_api import APITemplateParser
+from opencompass.registry import MODELS
+from opencompass.utils.logging import get_logger
+from opencompass.utils.prompt import PromptList
+
+PromptType = Union[PromptList, str]
+
+
+class MultiTokenEOSCriteria(transformers.StoppingCriteria):
+    """Criteria to stop on the specified multi-token sequence."""
+
+    def __init__(
+            self,
+            sequence: str,
+            tokenizer: transformers.PreTrainedTokenizer,
+            batch_size: int,
+    ):
+        self.done_tracker = [False] * batch_size
+        self.sequence = sequence
+        self.sequence_ids = tokenizer.encode(sequence,
+                                             add_special_tokens=False)
+        self.sequence_id_len = len(self.sequence_ids)
+        self.tokenizer = tokenizer
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        # compare the last len(stop) tokens
+        lookback_ids_batch = input_ids[:, -self.sequence_id_len:]
+        lookback_tokens_batch = self.tokenizer.batch_decode(lookback_ids_batch)
+        for i, done in enumerate(self.done_tracker):
+            if done:
+                continue
+            self.done_tracker[i] = self.sequence in lookback_tokens_batch[i]
+        return False not in self.done_tracker
+
+
+@MODELS.register_module()
+class HuggingFace(BaseModel):
+    """Model wrapper around HuggingFace models.
+
+    Args:
+        path (str): The name or path to HuggingFace's model.
+        hf_cache_dir: Set the cache dir to HF model cache dir. If None, it will
+            use the env variable HF_MODEL_HUB. Defaults to None.
+        max_seq_len (int): The maximum length of the input sequence. Defaults
+            to 2048.
+        tokenizer_path (str): The path to the tokenizer. Defaults to None.
+        tokenizer_kwargs (dict): Keyword arguments for the tokenizer.
+            Defaults to {}.
+        peft_path (str, optional): The name or path to the HuggingFace's PEFT
+            model. If None, the original model will not be converted to PEFT.
+            Defaults to None.
+        tokenizer_only (bool): If True, only the tokenizer will be initialized.
+            Defaults to False.
+        model_kwargs (dict): Keyword arguments for the model, used in loader.
+            Defaults to dict(device_map='auto').
+        meta_template (Dict, optional): The model's meta prompt
+            template if needed, in case the requirement of injecting or
+            wrapping of any meta instructions.
+        extract_pred_after_decode (bool): Whether to extract the prediction
+            string from the decoded output string, instead of extract the
+            prediction tokens before decoding. Defaults to False.
+        batch_padding (bool): If False, inference with be performed in for-loop
+            without batch padding.
+        pad_token_id (int): The id of the padding token. Defaults to None. Use
+            (#vocab + pad_token_id) if get negative value.
+        mode (str, optional): The method of input truncation when input length
+            exceeds max_seq_len. 'mid' represents the part of input to
+            truncate. Defaults to 'none'.
+        use_fastchat_template (str, optional): Whether to use fastchat to get
+            the conversation template. If True, fastchat needs to be
+            implemented first. Defaults to False.
+        end_str (str, optional): Whether to trim generated strings with end_str
+            if the model has special ending strings that are not handled well.
+            Defaults to None.
+
+    Note:
+        About ``extract_pred_after_decode``: Commonly, we should extract the
+        the prediction tokens before decoding. But for some tokenizers using
+        ``sentencepiece``, like LLaMA,  this behavior may change the number of
+        whitespaces, which is harmful for Python programming tasks.
+    """
+
+    def __init__(self,
+                 path: str,
+                 hf_cache_dir: Optional[str] = None,
+                 max_seq_len: int = 2048,
+                 tokenizer_path: Optional[str] = None,
+                 tokenizer_kwargs: dict = dict(),
+                 peft_path: Optional[str] = None,
+                 tokenizer_only: bool = False,
+                 model_kwargs: dict = dict(device_map='auto'),
+                 generation_kwargs: dict = dict(),
+                 meta_template: Optional[Dict] = None,
+                 extract_pred_after_decode: bool = False,
+                 batch_padding: bool = False,
+                 pad_token_id: Optional[int] = None,
+                 mode: str = 'none',
+                 use_fastchat_template: bool = False,
+                 end_str: Optional[str] = None):
+        super().__init__(path=path,
+                         max_seq_len=max_seq_len,
+                         tokenizer_only=tokenizer_only,
+                         meta_template=meta_template)
+        if hf_cache_dir is None:
+            hf_cache_dir = os.getenv('HF_MODEL_HUB', None)
+        self.logger = get_logger()
+        self.pad_token_id = pad_token_id
+        assert mode in ['none', 'mid']
+        self.mode = mode
+        self._load_tokenizer(path=path,
+                             tokenizer_path=tokenizer_path,
+                             tokenizer_kwargs=tokenizer_kwargs)
+        self.batch_padding = batch_padding
+        self.extract_pred_after_decode = extract_pred_after_decode
+        if not tokenizer_only:
+            self._load_model(path=path,
+                             model_kwargs=model_kwargs,
+                             peft_path=peft_path)
+        self.generation_kwargs = generation_kwargs
+        self.use_fastchat_template = use_fastchat_template
+        self.end_str = end_str
+
+    def _load_tokenizer(self, path: str, tokenizer_path: Optional[str],
+                        tokenizer_kwargs: dict):
+        # xz added m2m100tokenizer
+        # from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, M2M100Tokenizer, NllbTokenizer, AutoModelForSeq2SeqLM
+
+        if 'nllb' in path.lower():
+            # NLLB 模型必须使用 NllbTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+            path,
+            src_lang="ind_Latn",  # 印尼语
+            tgt_lang="tha_Thai",  # 泰语
+            use_fast=True  # 保留Fast分词器（速度快）          
+            )
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                path,
+                torch_dtype="auto"
+            )
+
+            #self.tokenizer = NllbTokenizer.from_pretrained(path, **tokenizer_kwargs)
+        elif 'm2m100' in path.lower():
+            # M2M100 模型使用专用分词器
+            self.tokenizer = M2M100Tokenizer.from_pretrained(path, **tokenizer_kwargs)
+
+        # self.tokenizer = AutoTokenizer.from_pretrained(
+        #   tokenizer_path if tokenizer_path else path, **tokenizer_kwargs)
+
+        # xz added verify the translation parameter
+        if 'src_lang' in tokenizer_kwargs:
+            self.logger.info(f"Tokenizer 源语言设置为: {tokenizer_kwargs['src_lang']}")  # 改为 info
+        if 'tgt_lang' in tokenizer_kwargs:
+            self.logger.info(
+                f"Tokenizer 目标语言设置为: {tokenizer_kwargs['tgt_lang']}")  # 改为 infoif 'src_lang' in tokenizer_kwrgs:
+
+        # A patch for some models without pad_token_id
+        if self.pad_token_id is not None:
+            if self.pad_token_id < 0:
+                self.pad_token_id += self.tokenizer.vocab_size
+            if self.tokenizer.pad_token_id is None:
+                self.logger.debug(f'Using {self.pad_token_id} as pad_token_id')
+            elif self.tokenizer.pad_token_id != self.pad_token_id:
+                self.logger.warning(
+                    'pad_token_id is not consistent with the tokenizer. Using '
+                    f'{self.pad_token_id} as pad_token_id')
+            self.tokenizer.pad_token_id = self.pad_token_id
+        elif self.tokenizer.pad_token_id is None:
+            self.logger.warning('pad_token_id is not set for the tokenizer.')
+            if self.tokenizer.eos_token is not None:
+                self.logger.warning(
+                    f'Using eos_token_id {self.tokenizer.eos_token} '
+                    'as pad_token_id.')
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                from transformers.generation import GenerationConfig
+                gcfg = GenerationConfig.from_pretrained(path)
+
+                if gcfg.pad_token_id is not None:
+                    self.logger.warning(
+                        f'Using pad_token_id {gcfg.pad_token_id} '
+                        'as pad_token_id.')
+                    self.tokenizer.pad_token_id = gcfg.pad_token_id
+                else:
+                    raise ValueError(
+                        'pad_token_id is not set for this tokenizer. Try to '
+                        'set pad_token_id via passing '
+                        '`pad_token_id={PAD_TOKEN_ID}` in model_cfg.')
+
+        # A patch for llama when batch_padding = True
+        if 'decapoda-research/llama' in path or \
+                (tokenizer_path and
+                 'decapoda-research/llama' in tokenizer_path):
+            self.logger.warning('We set new pad_token_id for LLaMA model')
+            # keep consistent with official LLaMA repo
+            # https://github.com/google/sentencepiece/blob/master/python/sentencepiece_python_module_example.ipynb  # noqa
+            self.tokenizer.bos_token = '<s>'
+            self.tokenizer.eos_token = '</s>'
+            self.tokenizer.pad_token_id = 0
+
+    def _set_model_kwargs_torch_dtype(self, model_kwargs):
+        if 'torch_dtype' not in model_kwargs:
+            torch_dtype = torch.float16
+        else:
+            torch_dtype = {
+                'torch.float16': torch.float16,
+                'torch.bfloat16': torch.bfloat16,
+                'torch.float': torch.float,
+                'auto': 'auto',
+                'None': None
+            }.get(model_kwargs['torch_dtype'])
+        self.logger.debug(f'HF using torch_dtype: {torch_dtype}')
+        if torch_dtype is not None:
+            model_kwargs['torch_dtype'] = torch_dtype
+
+    def _load_model(self,
+                    path: str,
+                    model_kwargs: dict,
+                    peft_path: Optional[str] = None):
+
+        from transformers import AutoModel, AutoModelForCausalLM
+        from transformers import M2M100ForConditionalGeneration
+        from transformers import AutoModelForSeq2SeqLM  # 确保导入
+
+        self._set_model_kwargs_torch_dtype(model_kwargs)
+
+        # xz added model type
+        # if path == 'facebook/m2m100_1.2B':
+        # 单独加载M2M100的生成类
+        # self.model = M2M100ForConditionalGeneration.from_pretrained(path, **model_kwargs)
+        # self.model = M2M100ForConditionalGeneration.from_pretrained(path, **model_kwargs)
+        # self.model = AutoModelForSeq2SeqLM.from_pretrained(path, **model_kwargs)
+        # if 'nllb' in path.lower():
+        # self.model = AutoModelForSeq2SeqLM.from_pretrained(path,** model_kwargs)
+        if 'm2m100' in path.lower():
+            self.model = M2M100ForConditionalGeneration.from_pretrained(path, **model_kwargs)
+        # 补充：若为 NLLB 等其他 Seq2Seq 模型，也需单独处理
+        elif 'nllb' in path.lower():
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(path, **model_kwargs)
+
+        else:
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
+            except ValueError:
+                self.model = AutoModel.from_pretrained(path, **model_kwargs)
+
+        if peft_path is not None:
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model,
+                                                   peft_path,
+                                                   is_trainable=False)
+        self.model.eval()
+
+        ## xz add if generation_config is None ##
+        if self.model.generation_config is None:
+            from transformers import GenerationConfig
+            self.model.generation_config = GenerationConfig.from_model_config(self.model.config)
+
+        # 打印生成配置的所有参数
+        print("生成配置参数：")
+        print(self.model.generation_config)
+
+        self.model.generation_config.do_sample = False
+
+        # A patch for llama when batch_padding = True
+        if 'decapoda-research/llama' in path:
+            self.model.config.bos_token_id = 1
+            self.model.config.eos_token_id = 2
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
+    def generate(self,
+                 inputs: List[str],
+                 max_out_len: int,
+                 min_out_len: Optional[int] = None,
+                 stopping_criteria: List[str] = [],
+                 **kwargs) -> List[str]:
+        """Generate results given a list of inputs.
+
+        Args:
+            inputs (List[str]): A list of strings.
+            max_out_len (int): The maximum length of the output.
+            min_out_len (Optional[int]): The minimum length of the output.
+
+        Returns:
+            List[str]: A list of generated strings.
+        """
+        generation_kwargs = kwargs.copy()
+        generation_kwargs.update(self.generation_kwargs)
+        if self.batch_padding and len(inputs) > 1:
+            return self._batch_generate(inputs=inputs,
+                                        max_out_len=max_out_len,
+                                        min_out_len=min_out_len,
+                                        stopping_criteria=stopping_criteria,
+                                        **generation_kwargs)
+        else:
+            return sum(
+                (self._single_generate(inputs=[input_],
+                                       max_out_len=max_out_len,
+                                       min_out_len=min_out_len,
+                                       stopping_criteria=stopping_criteria,
+                                       **generation_kwargs)
+                 for input_ in inputs), [])
+
+    def _batch_generate(self,
+                        inputs: List[str],
+                        max_out_len: int,
+                        min_out_len: Optional[int] = None,
+                        stopping_criteria: List[str] = [],
+                        **kwargs) -> List[str]:
+        """Support for batch prompts inference.
+
+        Args:
+            inputs (List[str]): A list of strings.
+            max_out_len (int): The maximum length of the output.
+
+        Returns:
+            List[str]: A list of generated strings.
+        """
+        # xz added show generation kwarge
+        generation_kwargs = {**self.generation_kwargs, **kwargs}
+        self.logger.info(f"生成参数: {generation_kwargs}")  # 新增日志
+
+        if self.extract_pred_after_decode:
+            prompt_lens = [len(input_) for input_ in inputs]
+
+        if self.use_fastchat_template:
+            try:
+                from fastchat.model import get_conversation_template
+            except ModuleNotFoundError:
+                raise ModuleNotFoundError(
+                    'Fastchat is not implemented. You can use '
+                    '\'pip install "fschat[model_worker,webui]"\' '
+                    'to implement fastchat.')
+            for i in range(len(inputs)):
+                conv = get_conversation_template('vicuna')
+                conv.append_message(conv.roles[0], inputs[i])
+                conv.append_message(conv.roles[1], None)
+                inputs[i] = conv.get_prompt()
+
+        # step-1: tokenize the input with batch_encode_plus
+
+        # 编码时指定源语言
+        tokens = self.tokenizer.batch_encode_plus(
+            inputs,
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_len,
+            src_lang=self.tokenizer.src_lang  # 显式传递源语言
+        )
+        # 生成时强制目标语言 ID
+        generation_kwargs['forced_bos_token_id'] = self.generation_kwargs.get('forced_bos_token_id')
+
+        tokens = {
+            k: torch.tensor(np.array(tokens[k]), device=self.model.device)
+            for k in tokens if k in ['input_ids', 'attention_mask']
+        }
+
+        origin_stopping_criteria = stopping_criteria
+        if stopping_criteria:
+            # Construct huggingface stopping criteria
+            if self.tokenizer.eos_token is not None:
+                stopping_criteria = stopping_criteria + [
+                    self.tokenizer.eos_token
+                ]
+            stopping_criteria = transformers.StoppingCriteriaList([
+                *[
+                    MultiTokenEOSCriteria(sequence, self.tokenizer,
+                                          tokens['input_ids'].shape[0])
+                    for sequence in stopping_criteria
+                ],
+            ])
+            kwargs['stopping_criteria'] = stopping_criteria
+
+        if min_out_len is not None:
+            kwargs['min_new_tokens'] = min_out_len
+
+        # step-2: conduct model forward to generate output
+        # 修复日志格式化，将变量嵌入 { } 中，复杂类型用 str() 转换
+        #self.logger.info(f"tokens= {str(tokens)}")  # 字典转字符串，避免格式混乱
+        #self.logger.info(f"self.model.generate= {self.model.generate}")  # 打印方法引用（确认存在）
+        self.logger.info(f"kwargs= {str(kwargs)}")  # kwargs 可能含复杂参数，转字符串
+
+        kwargs.pop('src_lang', None)
+        # self.logger.info(f"tokens=", tokens)
+        # self.logger.info(f"self.model.generate=", self.model.generate)
+        # self.logger.info(f"kwargs=", kwargs)
+        
+
+        if hasattr(self.tokenizer, 'get_lang_id'):
+            # �~@~B�~T��~NM2M100�~I�~E��~\~Iget_lang_id�~V��~U�~Z~D�~H~F�~M�~Y�
+            forced_bos_token_id = self.tokenizer.get_lang_id('th')
+        elif hasattr(self.tokenizer, 'lang_code_to_id'):
+            # �~@~B�~T��~NNLLB�~I使�~T�lang_code_to_id�~Z~D�~H~F�~M�~Y�
+            # 泰语对�~T�~Z~D代�'tha_Thai'
+            forced_bos_token_id = self.tokenizer.lang_code_to_id[tgt_lang]
+            self.tokenizer.src_lang = 'ind_Latn'
+            self.tokenizer.tgt_lang = 'tha_Thai'
+        else:
+            # �~E��~V类�~^~K�~H~F�~M�~Y��~M设置强�~H�语�~@
+            forced_bos_token_id = None
+
+        outputs = self.model.generate(**tokens,
+                                      max_new_tokens=max_out_len,
+                                      **kwargs)
+
+        if not self.extract_pred_after_decode:
+            outputs = outputs[:, tokens['input_ids'].shape[1]:]
+
+        decodeds = self.tokenizer.batch_decode(outputs,
+                                               skip_special_tokens=True)
+
+        if self.extract_pred_after_decode:
+            decodeds = [
+                token[len_:] for token, len_ in zip(decodeds, prompt_lens)
+            ]
+
+        if self.end_str:
+            decodeds = [token.split(self.end_str)[0] for token in decodeds]
+        if origin_stopping_criteria:
+            for t in origin_stopping_criteria:
+                decodeds = [token.split(t)[0] for token in decodeds]
+
+        # xz added verify output of translation
+        if hasattr(self.model, 'config') and 'm2m100' in self.path.lower():
+            tgt_lang = self.tokenizer_kwargs.get('tgt_lang', 'unknown')
+            print(f"{tokenizer_kwargs}")
+            self.logger.info(f"验证目标语言 {tgt_lang} 的输出: {decodeds[:1]}")
+
+        return decodeds
+
+    def _single_generate(self,
+                         inputs: List[str],
+                         max_out_len: int,
+                         min_out_len: Optional[int] = None,
+                         stopping_criteria: List[str] = [],
+                         **kwargs) -> List[str]:
+        """Support for single prompt inference with fixes for translation tasks."""
+
+        # 合并生成参数，确保目标语言ID等关键参数生效
+        generation_kwargs = {**self.generation_kwargs, **kwargs}
+        self.logger.info(f"生���参数: {generation_kwargs}")
+
+        if self.extract_pred_after_decode:
+            prompt_lens = [len(input_) for input_ in inputs]
+
+        # 处理对话模板（如无特殊需求可保持不变）
+        if self.use_fastchat_template:
+            try:
+                from fastchat.model import get_conversation_template
+            except ModuleNotFoundError:
+                raise ModuleNotFoundError('Fastchat is not installed.')
+            conv = get_conversation_template('vicuna')
+            conv.append_message(conv.roles[0], inputs[0])
+            conv.append_message(conv.roles[1], None)
+            inputs = [conv.get_prompt()]
+
+        # 截断逻辑优化：仅截断过长输入，避免破坏源语言结构
+ 
+        
+        if 'm2m100' in self.path.lower():
+            input_ids = self.tokenizer(
+                inputs,
+                truncation=True,
+                max_length=self.max_seq_len - max_out_len,
+            # 关键：显式指定源语言（针对M2M100等翻译模型）
+                src_lang=self.tokenizer.src_lang if hasattr(self.tokenizer, 'src_lang') else None
+            )['input_ids']
+            input_ids = torch.tensor(input_ids, device=self.model.device)
+        if 'nllb' in self.path.lower():
+            input_ids = self.tokenizer(inputs, return_tensors="pt", truncation=True, max_length=512)
+
+        # 终止符逻辑调整：翻译任务禁用自定义终止符，避免误截断
+        origin_stopping_criteria = stopping_criteria
+        stopping_criteria = []  # 清空自定义终止符，仅用模型默认EOS
+        if origin_stopping_criteria:
+            self.logger.warning("翻译任务中禁用自定义终止符，避免误截断")
+
+        # 确保最小生成长度，避免空输出
+        if min_out_len is not None:
+            generation_kwargs['min_new_tokens'] = min_out_len
+        else:
+            generation_kwargs['min_new_tokens'] = 10  # 翻译任务至少生成10个token
+
+        # 强制目标语言起始ID生效（针对M2M100/NLLB等模型）
+        if 'forced_bos_token_id' in generation_kwargs:
+            # 确保生成配置中的参数被覆盖
+            self.model.generation_config.forced_bos_token_id = generation_kwargs['forced_bos_token_id']
+
+        self.logger.info(f"self.model.generate= {self.model.generate}")  # �~I~S�~M��~V��~U�~U�~T��~H确认�~X�~\��~I
+        self.logger.info(
+            f"generation_kwargs= {str(generation_kwargs)}")  # kwargs �~O��~C��~P��~M�~]~B�~O~B�~U��~L转�~W符串
+
+        generation_kwargs.pop('src_lang', None)
+        # 生成输出
+
+        # ###
+        # test_cases = [
+        #     "Saya suka makan nasi goreng.",  # 我喜欢吃炒饭
+        #     "Hari ini cuaca sangat cerah.",  # 今天天气很晴朗
+        #     "Universitas ini memiliki perpustakaan besar.",  # 这所大学有一个大图书馆
+        #     "Dia bekerja sebagai dokter di rumah sakit terdekat.",  # 他在最近的医院当医生
+        #     "Kita akan pergi ke pantai besok.",  # 我们明天要去海滩
+        #     "Sebagian pasien kemungkinan ketularan penyakit itu di rumah sakit, menurut perkiraan Dr. Moll, dan paling sedikit dua orang adalah petugas kesehatan di rumah sakit.",
+        #     "Sara Danius, sekretaris permanen Komite Nobel Literatur di Akademi Swedia, pada hari Senin mengumumkan kepada publik selama berlangsungnya program radio di Sveriges Radio di Swedia bahwa komite tersebut tidak bisa menghubungi Bob Dylan secara langsung untuk menyampaikan kemenangannya atas Hadiah Nobel 2016 di bidang Literatur. Sara akhirnya menyerah menghubunginya.",
+        #     "Ring juga menyelesaikan sebuah tuntutan hukum terhadap perusahaan keamanan saingan, ADT Corporation."
+        # ]
+        # 
+        # # 执行翻译
+        # print("开始翻译测试...\n")
+        # for i, text in enumerate(test_cases, 1):
+        #     print(f"测试用例 {i}:")
+        #     print(f"印尼语原文: {text}")
+        # 
+        #     # 编码输入文本
+        #     encoded_input = self.tokenizer(text, return_tensors="pt")
+        # 
+        #     input_ids = torch.tensor(input_ids, device=self.model.device)
+        # 
+        #     print("tokenizer.get_lang_id(tgt_lang) is ", self.tokenizer.get_lang_id('th'))
+        # 
+        #     print("encoded_input", encoded_input)
+        #     # print("tokenizer", self.tokenizer)
+        #     # print("model.generate", self.model.generate)
+        # 
+        #     # 生成泰语翻译（强制目标语言）
+        #     generated_tokens = self.model.generate(
+        #         input_ids=encoded_input['input_ids'].to(self.model.device),
+        #     )
+        #     print("generated_tokens == ", generated_tokens)
+        # 
+        #     translated_text = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+        #     print(f"泰语译文: {translated_text}\n")
+        # ###
+
+        if hasattr(self.tokenizer, 'get_lang_id'):
+            # 适用于M2M100等具有get_lang_id方法的分词器
+            forced_bos_token_id = self.tokenizer.get_lang_id('th')
+        elif hasattr(self.tokenizer, 'lang_code_to_id'):
+            # 适用于NLLB等使用lang_code_to_id的分词器
+            # 泰语对应的代�'tha_Thai'
+            forced_bos_token_id = self.tokenizer.lang_code_to_id.get('tha_Thai', None)
+            self.tokenizer.src_lang = 'ind_Latn'
+            self.tokenizer.tgt_lang = 'tha_Thai'
+        else:
+            # 其他类型分词器不设置强制语言
+            forced_bos_token_id = None
+
+        # 生成模型输出
+        outputs = self.model.generate(
+            input_ids=input_ids,
+            forced_bos_token_id=forced_bos_token_id,  # 根据分词器类型设置的语言参数
+            max_length=100,
+            num_beams=4
+        )
+        
+        print("outputs == ", outputs)
+        decodeds = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        return decodeds
+
+    def get_logits(self, inputs: List[str]):
+
+        if self.batch_padding and len(inputs) > 1:
+            # batch inference
+            tokens = self.tokenizer(inputs,
+                                    padding=True,
+                                    truncation=True,
+                                    max_length=self.max_seq_len)
+
+            tokens = {
+                k: torch.tensor(np.array(tokens[k]), device=self.model.device)
+                for k in tokens if k in ['input_ids', 'attention_mask']
+            }
+            outputs = self.model(**tokens)
+
+        else:
+            input_ids = self.tokenizer(
+                inputs,
+                padding=False,
+                truncation=True,
+                max_length=self.max_seq_len)['input_ids']
+            input_ids = torch.tensor(input_ids, device=self.model.device)
+            tokens = {'input_ids': input_ids}
+
+            outputs = self.model(input_ids)
+        return outputs[0], {'tokens': tokens}
+
+    def get_ppl(self,
+                inputs: List[str],
+                mask_length: Optional[List[int]] = None) -> List[float]:
+        """Get perplexity scores given a list of inputs.
+
+        Args:
+            inputs (List[str]): A list of strings.
+            mask_length (Optional[List[int]]): A list of mask lengths. If
+                provided, the perplexity scores will be calculated with the
+                first mask_length[i] tokens masked out. It's okay to skip
+                its implementation if advanced features in PPLInfernecer is
+                not needed.
+
+        Returns:
+            List[float]: A list of perplexity scores.
+        """
+
+        if self.batch_padding and len(inputs) > 1:
+            assert self.tokenizer.pad_token
+            return self._get_ppl(inputs, mask_length=mask_length)
+        else:
+            return np.concatenate([
+                self._get_ppl(inputs=[text], mask_length=mask_length)
+                for text in inputs
+            ])
+
+    def _get_ppl(self,
+                 inputs: List[str],
+                 mask_length: Optional[List[int]] = None) -> List[float]:
+        """Get perplexity scores given a list of inputs.
+
+        Args:
+            inputs (List[str]): A list of strings.
+            mask_length (Optional[List[int]]): A list of mask lengths. If
+                provided, the perplexity scores will be calculated with the
+                first mask_length[i] tokens masked out. It's okay to skip
+                its implementation if advanced features in PPLInfernecer is
+                not needed.
+
+        Returns:
+            List[float]: A list of perplexity scores.
+        """
+
+        outputs, inputs = self.get_logits(inputs)
+        shift_logits = outputs[..., :-1, :].contiguous().float()
+
+        shift_labels = inputs['tokens']['input_ids'][..., 1:].contiguous()
+
+        loss_fct = torch.nn.CrossEntropyLoss(
+            reduction='none', ignore_index=self.tokenizer.pad_token_id)
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)).view(shift_labels.size())
+
+        if mask_length is not None:
+            mask = torch.zeros_like(shift_labels)  # [batch,seqlen]
+            for i in range(len(mask)):
+                for j in range(mask_length[i] - 1, len(mask[i])):
+                    mask[i][j] = 1
+            loss = loss * mask
+
+        lens = (inputs['tokens']['input_ids'] !=
+                self.tokenizer.pad_token_id).sum(-1).cpu().numpy()
+        if mask_length is not None:
+            lens -= np.array(mask_length)
+        ce_loss = loss.float().sum(-1).cpu().detach().numpy() / lens
+        return ce_loss
+
+    def get_loglikelihood(
+            self,
+            inputs: List[str],
+            conts: List[str],
+            mask_length: Optional[List[int]] = None) -> List[float]:
+        """Get loglikelihood scores given a list of inputs.
+
+        Args:
+            inputs (List[str]): A list of strings.
+            conts (List[str]): A list of strings: slices after the space.
+            NOT SUPPORT mask_length YET!
+            mask_length (Optional[List[int]]): A list of mask lengths. If
+                provided, the perplexity scores will be calculated with the
+                first mask_length[i] tokens masked out. It's okay to skip
+                its implementation if advanced features in PPLInfernecer is
+                not needed.
+
+        Returns:
+            List[float]: A list of loglikelihood scores.
+        """
+        assert mask_length is None, 'Not support mask_length yet.'
+        if self.batch_padding and len(inputs) > 1:
+            assert self.tokenizer.pad_token
+            return self._get_loglikelihood(inputs, conts)
+        else:
+            return np.concatenate([
+                self._get_loglikelihood(inputs=[inputs[idx]],
+                                        conts=[conts[idx]])
+                for idx in range(len(inputs))
+            ])
+
+    def _get_loglikelihood(self, inputs: str, conts: str) -> float:
+        """Get loglikelihood scores given input string and continuation string.
+
+        Args:
+            inputs (str): string.
+            conts (str): strings: slices after the space.
+        Returns:
+            float: loglikelihood scores.
+        """
+        input_tokenizer_out = self.tokenizer(inputs,
+                                             padding=True,
+                                             truncation=False,
+                                             return_length=True,
+                                             return_tensors='pt').to(
+            self.model.device)
+
+        input_ids = input_tokenizer_out['input_ids'][:, :self.max_seq_len]
+        input_length = input_tokenizer_out['length']
+        context_ids = [
+            self.tokenizer(inputs[i].replace(conts[i], ''),
+                           padding=False,
+                           truncation=True,
+                           max_length=self.max_seq_len)['input_ids']
+            for i in range(len(inputs))
+        ]
+        # forward
+        outputs = self.model(input_ids)['logits']
+        outputs = torch.nn.functional.log_softmax(outputs, dim=-1)
+        # calculate loglikelihood
+        answer = np.zeros(len(inputs))
+        for i in range(len(inputs)):
+            if self.tokenizer.padding_side == 'right':
+                cont_ids = input_ids[i, len(context_ids[i]):input_length[i]]
+                logits = outputs[i,
+                len(context_ids[i]) - 1:input_length[i] -
+                                        1, :]  # noqa
+            else:
+                cont_ids = input_ids[i, len(context_ids[i]) - input_length[i]:]
+                logits = outputs[i,
+                len(context_ids[i]) - input_length[i] - 1:-1]
+            # Reducing the dimension will lead to a wrong outcome
+            logits_gather = torch.gather(
+                logits.unsqueeze(0), 2,
+                cont_ids.unsqueeze(0).unsqueeze(-1))  # [1, seq]
+            # Answer: sum the likelihood of each token in continuation
+            answer[i] = float(logits_gather.detach().cpu().sum())
+        return answer
+
+    def get_mink_percent(self, inputs: List[str], k: int = 20) -> List[float]:
+        """https://swj0419.github.io/detect-pretrain.github.io/"""
+
+        if self.batch_padding and len(inputs) > 1:
+            assert self.tokenizer.pad_token
+            return self._get_mink_percent(inputs, k=k)
+        else:
+            return np.concatenate([
+                self._get_mink_percent(inputs=[text], k=k) for text in inputs
+            ])
+
+    def _get_mink_percent(self, inputs: List[str], k: int = 20) -> List[float]:
+        outputs, inputs = self.get_logits(inputs)
+        shift_logits = outputs[:, :-1, :].contiguous().float()
+        shift_labels = inputs['tokens']['input_ids'][:, 1:].contiguous()
+
+        loss_fct = torch.nn.CrossEntropyLoss(
+            reduction='none', ignore_index=self.tokenizer.pad_token_id)
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)).view(shift_labels.size())
+        lens = (inputs['tokens']['input_ids'] !=
+                self.tokenizer.pad_token_id).sum(-1).cpu().numpy()
+        mink_percent = []
+        for nloss, nlen in zip(loss, lens):
+            nlen = int(nlen)
+            minklen = max(nlen * k // 100, 1)
+            nloss = torch.topk(loss[-nlen:], minklen, dim=-1)[0]
+            nloss = -nloss.float().mean().cpu().detach().numpy()
+            mink_percent.append(nloss)
+        return np.array(mink_percent)
+
+    def get_token_len(self, prompt: str) -> int:
+        """Get lengths of the tokenized strings.
+
+        Args:
+            prompt (str): Input string.
+
+        Returns:
+            int: Length of the input tokens
+        """
+        return len(self.tokenizer.encode(prompt))
+
+
+@MODELS.register_module()
+class HuggingFaceCausalLM(HuggingFace):
+    """Model wrapper around HuggingFace CausalLM.
+
+    Args:
+        path (str): The name or path to HuggingFace's model.
+        hf_cache_dir: Set the cache dir to HF model cache dir. If None, it will
+            use the env variable HF_MODEL_HUB. Defaults to None.
+        max_seq_len (int): The maximum length of the input sequence. Defaults
+            to 2048.
+        tokenizer_path (str): The path to the tokenizer. Defaults to None.
+        tokenizer_kwargs (dict): Keyword arguments for the tokenizer.
+            Defaults to {}.
+        peft_path (str, optional): The name or path to the HuggingFace's PEFT
+            model. If None, the original model will not be converted to PEFT.
+            Defaults to None.
+        tokenizer_only (bool): If True, only the tokenizer will be initialized.
+            Defaults to False.
+        model_kwargs (dict): Keyword arguments for the model, used in loader.
+            Defaults to dict(device_map='auto').
+        meta_template (Dict, optional): The model's meta prompt
+            template if needed, in case the requirement of injecting or
+            wrapping of any meta instructions.
+        batch_padding (bool): If False, inference with be performed in for-loop
+            without batch padding.
+    """
+
+    def _load_model(self,
+                    path: str,
+                    model_kwargs: dict,
+                    peft_path: Optional[str] = None):
+        from transformers import AutoModelForCausalLM
+
+        self._set_model_kwargs_torch_dtype(model_kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
+        if peft_path is not None:
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model,
+                                                   peft_path,
+                                                   is_trainable=False)
+        self.model.eval()
+        self.model.generation_config.do_sample = False
+
+
+class HuggingFaceChatGLM3(HuggingFace):
+    """Model wrapper around HuggingFace's ChatGLM3. Details available in
+    `https://huggingface.co/THUDM/chatglm3-6b`.
+
+    model.chat() is used for inference.
+    """
+
+    def __init__(self,
+                 path: str,
+                 hf_cache_dir: Optional[str] = None,
+                 max_seq_len: int = 2048,
+                 tokenizer_path: Optional[str] = None,
+                 tokenizer_kwargs: dict = dict(),
+                 peft_path: Optional[str] = None,
+                 tokenizer_only: bool = False,
+                 model_kwargs: dict = dict(device_map='auto'),
+                 generation_kwargs: dict = dict(),
+                 meta_template: Optional[Dict] = None,
+                 extract_pred_after_decode: bool = False,
+                 batch_padding: bool = False,
+                 pad_token_id: Optional[int] = None,
+                 mode: str = 'none',
+                 num_extra_tokens: int = 50):
+        super().__init__(path=path,
+                         hf_cache_dir=hf_cache_dir,
+                         max_seq_len=max_seq_len,
+                         tokenizer_path=tokenizer_path,
+                         tokenizer_kwargs=tokenizer_kwargs,
+                         peft_path=peft_path,
+                         tokenizer_only=tokenizer_only,
+                         generation_kwargs=generation_kwargs,
+                         model_kwargs=model_kwargs,
+                         meta_template=meta_template,
+                         extract_pred_after_decode=extract_pred_after_decode,
+                         batch_padding=batch_padding,
+                         pad_token_id=pad_token_id,
+                         mode=mode)
+        self.template_parser = APITemplateParser(meta_template)
+        # used to compensate for #tokens occupied by sth like system prompt
+        self.num_extra_tokens = num_extra_tokens
+
+    def generate(self,
+                 inputs: List[PromptType],
+                 max_out_len: int = 512,
+                 skip_overlength=False,
+                 **kwargs) -> str:
+        """Generate response from input prompt.
+
+        Args:
+            inputs (list): input prompt
+            max_out_len (int): max output length
+        """
+        generation_kwargs = kwargs.copy()
+        generation_kwargs.update(self.generation_kwargs)
+
+        responses = []
+        for _input in inputs:
+            assert isinstance(_input, (str, PromptList))
+            if isinstance(_input, str):
+                history = [{'role': 'user', 'content': _input}]
+            else:
+                history = []
+                for item in _input:
+                    msg = {
+                        'content': item['prompt'],
+                        'role': {
+                            'HUMAN': 'user',
+                            'BOT': 'assistant',
+                            'SYSTEM': 'system',
+                        }[item['role'].upper()]
+                    }
+                    history.append(msg)
+            user_content = history[-1]['content']
+            history = history[:-1]
+
+            if skip_overlength:
+                # The model will report the following error
+                # if the sequence length is greater than the maximum length:
+                # "Input length of input_ids is {INPUT_IDS},
+                # but `max_length` is set to 8192.
+                # This can lead to unexpected behavior.
+                # You should consider increasing `max_new_tokens`."
+                # The following hardcode can fix this exception.
+                len_user_content = len(self.tokenizer.encode(user_content))
+                if len_user_content > 8192:
+                    responses.append('')
+                    continue
+
+            response, history = self.model.chat(self.tokenizer,
+                                                user_content,
+                                                history=history,
+                                                max_new_tokens=max_out_len,
+                                                **generation_kwargs)
+            # response will be dict sometime
+            if isinstance(response, dict):
+                response = response.get('content', '')
+            responses.append(response)
+        return responses
+
+    def get_token_len(self, prompt: str) -> int:
+        return len(self.tokenizer.encode(prompt)) + self.num_extra_tokens

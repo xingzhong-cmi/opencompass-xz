@@ -1,0 +1,12 @@
+from opencompass.models import HuggingFacewithChatTemplate
+
+models = [
+    dict(
+        type=HuggingFacewithChatTemplate,
+        abbr='indobert-finetune-tydiqa-transfer-indoqa',
+        path='andreaschandra/indobert-finetune-tydiqa-transfer-indoqa',  # 确保这里没有URL前缀
+        max_out_len=1024,
+        batch_size=8,
+        run_cfg=dict(num_gpus=4),
+    )
+]

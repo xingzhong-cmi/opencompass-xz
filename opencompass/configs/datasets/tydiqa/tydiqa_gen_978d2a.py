@@ -12,6 +12,8 @@ tydiqa_reader_cfg = dict(
 
 langs = ['arabic', 'bengali', 'english', 'finnish', 'indonesian', 'japanese', 'korean', 'russian', 'swahili', 'telugu', 'thai']
 
+#langs = ['indonesian']
+
 prefixs_prompt = {
     'english': ('Answer the following question based on the information in the given passage.', 'Passage:', 'Question:', 'Answer:'),
     'arabic': ('أجب على السؤال التالي بناءً على المعلومات في المقطع المعطى.', 'المقطع:', 'السؤال:', 'الإجابة:'),
@@ -52,7 +54,7 @@ for _lang in langs:
     tydiqa_datasets.append(
         dict(abbr=f'tydiqa-goldp_{_lang}',
             type=TydiQADataset,
-            path='opencompass/tydiqa',
+            path='/workspace/data/tydiqa/',  # 'opencompass/tydiqa'
             lang=_lang,
             reader_cfg=tydiqa_reader_cfg,
             infer_cfg=tydiqa_infer_cfg,

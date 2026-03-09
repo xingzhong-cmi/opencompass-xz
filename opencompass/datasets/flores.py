@@ -29,7 +29,7 @@ class FloresFirst100Dataset(BaseDataset):
 
     @staticmethod
     def load(path, name):
-        path = get_data_path(path)
+        # path = get_data_path(path)  
         src_lang, tgt_lang = name.split('-')
         if environ.get('DATASET_SOURCE') == 'ModelScope':
             from modelscope import MsDataset
